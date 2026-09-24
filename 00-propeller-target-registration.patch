@@ -1,0 +1,60 @@
+diff -urN a/config.sub b/config.sub
+--- a/config.sub	2026-08-07 03:46:05.304676553 -0400
++++ b/config.sub	2026-09-22 10:44:28.605988610 -0400
+@@ -1250,6 +1250,7 @@
+ 			| pdp10 | pdp11 | pj | pjl | pn | power \
+ 			| powerpc | powerpc64 | powerpc64le | powerpcle | powerpcspe \
+ 			| pru \
++			| propeller \
+ 			| pyramid \
+ 			| riscv | riscv32 | riscv32be | riscv64 | riscv64be \
+ 			| rl78 | romp | rs6000 | rx \
+diff -urN a/gcc/config.gcc b/gcc/config.gcc
+--- a/gcc/config.gcc	2026-08-07 03:46:05.819684556 -0400
++++ b/gcc/config.gcc	2026-09-22 10:44:28.607988631 -0400
+@@ -564,6 +564,9 @@
+ 	target_gtfiles="$target_gtfiles \$(srcdir)/config/rs6000/rs6000-pcrel-opt.cc"
+ 	target_gtfiles="$target_gtfiles ./rs6000-builtins.h"
+ 	;;
++propeller-*)
++	cpu_type=propeller
++	;;
+ pru-*-*)
+ 	cpu_type=pru
+ 	;;
+@@ -2610,6 +2613,11 @@
+ 	# automatically detect that GAS supports it, yet we require it.
+ 	gcc_cv_initfini_array=yes
+ 	;;
++propeller-*-*)
++	tm_file="${tm_file} newlib-stdint.h"
++	use_gcc_stdint=wrap
++	tmake_file="propeller/t-propeller propeller/t-propeller-softfp soft-fp/tsoftfp"
++	;;
+ riscv*-*-elf* | riscv*-*-rtems*)
+ 	tm_file="elfos.h newlib-stdint.h ${tm_file} riscv/elf.h"
+ 	case ${target} in
+diff -urN a/libgcc/config.host b/libgcc/config.host
+--- a/libgcc/config.host	2026-08-07 03:46:09.988749343 -0400
++++ b/libgcc/config.host	2026-09-22 10:44:28.611910426 -0400
+@@ -176,6 +176,9 @@
+ powerpc*-*-*)
+ 	cpu_type=rs6000
+ 	;;
++propeller*-*-*)
++	cpu_type=propeller
++	;;
+ pru-*-*)
+ 	cpu_type=pru
+ 	;;
+@@ -1373,6 +1376,10 @@
+ 	tmake_file="t-fdpbit rs6000/t-ppc64-fp rs6000/t-slibgcc-aix rs6000/t-ibm-ldouble rs6000/t-aix-cxa"
+ 	extra_parts="crtcxa.o crtcxa_s.o crtdbase.o crtcxa_64.o crtcxa_64_s.o crtdbase_64.o"
+ 	;;
++propeller-*-elf*)
++	extra_parts=""
++	tmake_file="propeller/t-propeller"
++	;;
+ rl78-*-elf)
+ 	tmake_file="$tm_file t-fdpbit rl78/t-rl78"
+ 	;;
