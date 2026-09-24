@@ -13,8 +13,9 @@ follows is what is different.
 
 ## 1. Bugs fixed
 
-Seven defects in the original back end and runtime.  Each is a wrong-code or
-crash bug, not a missed optimisation.
+Nine defects in the original back end and runtime, or in how it interacts
+with current GCC.  Each is a wrong-code or crash bug, not a missed
+optimisation.
 
 **1. `CNT`, `INA`, `INB` and `PAR` could be placed in an instruction's d-field.**
 The Propeller Manual v1.2 (register table, p.23, note 1) states that these
@@ -59,6 +60,27 @@ constant, while the predicates also admitted cog memory.
 The post-reload 64-bit move splitter assumed the address was always a plain
 register and asserted otherwise.
 
+**8. Cog images were linked without their start code.**
+propgcc builds a cog overlay with `gcc -mcog -r`: a relocatable object that is
+nevertheless a complete program, copied into a cog and started at cog address
+0.  GCC 6's link spec added the start files to any `-r` link; current GCC
+guards them with `%{!r:...}`, which is right for an ordinary partial link but
+left cog images with no start code - they began with whatever literal pool the
+compiler had emitted, and the loader jumped straight into data.
+`LINK_COMMAND_SPEC` is now overridden so that the start files, default
+libraries and end files are linked when `-r` is combined with `-mcog`.  An
+ordinary partial link is unaffected.
+
+**9. Naked functions were left without a return.**
+On this target `naked` is used to suppress the frame, not to hand-write the
+whole function: cog code often has no stack, so ordinary C functions are marked
+naked purely to stop a frame being built.  GCC 6 still gave them a return, via
+a path that current GCC no longer takes for naked functions, so they were left
+falling through into whatever followed.  A non-native naked function now gets
+the ordinary return again.  A *native* naked function does not: its return is a
+named `<func>_ret` label, which such functions normally define themselves, and
+emitting a second one is a duplicate symbol error.
+
 ---
 
 ## 2. New instruction support
@@ -96,6 +118,20 @@ flags change only when `wz`/`wc` is requested — which is exactly what lets the
 back end keep a condition live across arithmetic and use predicated
 instructions.
 
+### New warning: `-Wcog-stack`
+
+Code generated for cog memory will build a stack frame if register pressure
+demands it.  That is fine for a standalone `-mcog` program, whose start code
+sets `sp` up, but an overlay copied straight into a cog usually has no stack,
+and the frame then writes through whatever `sp` happens to hold.  `-Wcog-stack`
+names any function this happens to:
+
+    driver.c:300:1: warning: 'check_error' needs a 8 byte stack frame, but cog
+      code has no stack unless sp is set up for it [-Wcog-stack]
+
+It is off by default, since a standalone cog program legitimately has a stack.
+Turn it on, with `-Werror=cog-stack` if you like, when building cog overlays.
+
 ### Measured effect
 
 On a set of four large, hand-optimised closed-source Propeller applications
@@ -103,8 +139,8 @@ On a set of four large, hand-optimised closed-source Propeller applications
 
 | | |
 |---|---|
-| total code size | **-3.6%** |
-| best single application | **-5.4%** |
+| total code size | **-2.2%** |
+| best single application | **-4.6%** |
 | cog/ecog driver modules | smaller in every case, **-5% to -22%** |
 
 Because Propeller instructions are almost all fixed-time, a size reduction of
@@ -171,7 +207,11 @@ Neither is my work; both are noted here for provenance.
   directly into a cog usually has no stack, and the frame would then corrupt
   the module's own cog image.  This is inherited behaviour, not new — the
   original compiler does the same thing under enough pressure — but GCC 16's
-  register allocator reaches the threshold somewhat sooner.  If you build cog
-  overlays, check the generated assembly for references to `sp`.
+  register allocator reaches the threshold somewhat sooner.  Build cog overlays
+  with `-Wcog-stack` (see above) and the compiler will name any function this
+  happens to; `-Werror=cog-stack` turns it into a build failure.  Nothing in
+  code generation avoids it: making the callee-saved registers caller-saved, or
+  fixing them out of the allocation order, or repricing memory moves, all leave
+  the allocator spilling instead, which is worse.
 * The C++ compiler is not built; this is a C toolchain.
 * Propeller 2 is not supported, exactly as before.

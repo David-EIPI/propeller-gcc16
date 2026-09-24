@@ -1,5 +1,5 @@
 diff -urN a/gcc/config/propeller/constraints.md b/gcc/config/propeller/constraints.md
---- a/gcc/config/propeller/constraints.md	2026-09-22 12:07:37.073271364 -0400
+--- a/gcc/config/propeller/constraints.md	2026-09-23 22:40:23.932440724 -0400
 +++ b/gcc/config/propeller/constraints.md	2026-09-22 10:20:55.000000000 -0400
 @@ -50,6 +50,20 @@
         (and (match_code "reg")
@@ -23,7 +23,7 @@ diff -urN a/gcc/config/propeller/constraints.md b/gcc/config/propeller/constrain
    "A register indirect memory operand pointing into the stack."
    (and (match_code "mem")
 diff -urN a/gcc/config/propeller/predicates.md b/gcc/config/propeller/predicates.md
---- a/gcc/config/propeller/predicates.md	2026-09-22 12:07:37.070551251 -0400
+--- a/gcc/config/propeller/predicates.md	2026-09-23 22:40:23.930365142 -0400
 +++ b/gcc/config/propeller/predicates.md	2026-09-21 01:40:59.000000000 -0400
 @@ -49,10 +49,18 @@
         (match_test "SYMBOL_REF_FUNCTION_P (op)")))
@@ -69,8 +69,8 @@ diff -urN a/gcc/config/propeller/predicates.md b/gcc/config/propeller/predicates
  (define_predicate "propeller_add_operand"
    (ior (match_operand 0 "propeller_src_operand")
 diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.cc
---- a/gcc/config/propeller/propeller.cc	2026-09-22 12:07:37.057551121 -0400
-+++ b/gcc/config/propeller/propeller.cc	2026-09-22 10:26:13.000000000 -0400
+--- a/gcc/config/propeller/propeller.cc	2026-09-23 22:40:23.919214970 -0400
++++ b/gcc/config/propeller/propeller.cc	2026-09-23 22:17:22.000000000 -0400
 @@ -20,79 +20,52 @@
     along with GCC; see the file COPYING3.  If not see
     <http://www.gnu.org/licenses/>.  */
@@ -458,7 +458,75 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
                     gen_rtx_MEM (SImode,
                                  i == 0 ? stack_pointer_rtx
                                  : plus_constant (Pmode, stack_pointer_rtx,
-@@ -3597,10 +3654,11 @@
+@@ -2255,6 +2312,23 @@
+ 
+   propeller_compute_frame_info ();
+ 
++  /* Cog code very often runs with no stack.  An overlay copied into a cog
++     starts executing at cog address 0 with sp holding whatever the image put
++     there, or whatever crt0_cog copied out of PAR - which in a driver is
++     usually a pointer to shared data, not a stack.  A frame then writes
++     through it and corrupts something else entirely, with no other symptom.
++     GCC 6 happened to keep these functions frameless; this compiler's
++     allocator is readier to spend a callee-saved register, so say something
++     rather than let it pass silently.  */
++  if (warn_cog_stack
++      && !TARGET_LMM && !TARGET_XMM
++      && cfun->machine->frame.total_size > 0)
++    warning (OPT_Wcog_stack,
++	     "%qD needs a %wd byte stack frame, but cog code has no stack "
++	     "unless sp is set up for it",
++	     current_function_decl,
++	     (HOST_WIDE_INT) cfun->machine->frame.total_size);
++
+   if (cfun->machine->frame.total_size > 0)
+     {
+       /* Save callee save registers.  */
+@@ -2306,12 +2380,38 @@
+   if (is_naked_function (current_function_decl))
+   {
+       gcc_assert(! is_sibcall);
+-      /* Naked functions use their own, programmer provided epilogues.
+-         But, in order to keep gcc happy we have to generate some kind of
+-         epilogue RTL.  */
+-      emit_jump_insn (gen_naked_return ());
+-      return;
+ 
++      /* A naked function gets no frame set-up or tear-down - that is the
++         point of the attribute on this target, where cog code often has no
++         stack at all - but it still gets a return.
++
++         GCC 6 emitted one for every non-native naked function, though not
++         through this path: propeller_can_use_return() reported that a
++         frameless function with lr dead could use a plain return insn, so
++         the middle end emitted one and never called the epilogue expander.
++         Current GCC knows about "naked" and suppresses that, which leaves
++         the function with no return at all.  The propgcc cog drivers depend
++         on the old behaviour:
++         they mark ordinary C functions _NAKED purely to suppress the frame,
++         and have no way to return otherwise.  Leaving the return out makes
++         such a function fall through into whatever the assembler placed
++         next, which is silent and very hard to diagnose.  A hand written
++         naked function that already ends in its own return simply gets one
++         unreachable instruction after it.  */
++      if (is_native_function (current_function_decl))
++        {
++          /* A native return is a named "<func>_ret" label, and a hand
++             written native naked function normally defines that label
++             itself; emitting a second one is a duplicate symbol error.
++             GCC 6 reached this case through the epilogue expander too and
++             emitted nothing, so keep the placeholder here.  */
++          emit_jump_insn (gen_naked_return ());
++        }
++      else if (TARGET_LMM)
++        emit_jump_insn (gen_return_lmm (lr_rtx));
++      else
++        emit_jump_insn (gen_return_cog (lr_rtx));
++      return;
+   }
+   propeller_compute_frame_info ();
+ 
+@@ -3597,10 +3697,11 @@
                   but now we need it to go to the end of the
                   fcache section
                */
@@ -473,7 +541,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
  
                const_label = gen_label_rtx ();
                LABEL_NUSES (const_label)++;
-@@ -3608,7 +3666,7 @@
+@@ -3608,7 +3709,7 @@
  
                last = emit_label_after (const_label, last);
                INSN_ADDRESSES_NEW (last, -1);
@@ -482,7 +550,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
                mode = GET_MODE (SET_DEST (pattern));
                /* now the actual word */
                const_insn = gen_fcache_const_word (SET_SRC (pattern));
-@@ -3617,7 +3675,7 @@
+@@ -3617,7 +3718,7 @@
  
                /* finally, modify the existing move instruction */
                /* update the pattern */
@@ -491,7 +559,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
                emit_insn_before (pattern, mov_insn);
                /* delete the old one */
                delete_insn (mov_insn);
-@@ -3988,6 +4046,200 @@
+@@ -3988,6 +4089,200 @@
  #undef TARGET_LRA_P
  #define TARGET_LRA_P propeller_lra_p
  
@@ -693,9 +761,52 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
  
  #include "gt-propeller.h"
 diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
---- a/gcc/config/propeller/propeller.h	2026-09-22 12:07:37.061565033 -0400
-+++ b/gcc/config/propeller/propeller.h	2026-09-20 23:21:22.000000000 -0400
-@@ -130,10 +130,8 @@
+--- a/gcc/config/propeller/propeller.h	2026-09-23 22:40:23.921624337 -0400
++++ b/gcc/config/propeller/propeller.h	2026-09-23 22:08:18.000000000 -0400
+@@ -52,6 +52,42 @@
+   }                                             \
+ "
+ 
++/* propgcc builds a cog image with "gcc -mcog -r -o x.cog x.c": a relocatable
++   object that is nevertheless a complete, self contained program, copied
++   into a cog and started at cog address 0.  It therefore needs crt0_cog and
++   the default libraries, exactly as a normal link would.
++
++   GCC 6 linked the start files for any -r link, because its LINK_COMMAND_SPEC
++   read "%{!nostdlib:%{!nostartfiles:%S}}".  Current GCC guards all three of
++   the start file, default library and end file clauses with %{!r:...}, which
++   is right for an ordinary partial link but leaves a cog image with no start
++   code at all - it begins with whatever literal pool the compiler emitted,
++   and the loader jumps straight into data.
++
++   Restore the old behaviour for -mcog only, by relaxing those three guards
++   from "not -r" to "not -r, or -mcog".  An ordinary partial link of
++   hub code keeps the modern behaviour.  */
++
++#undef LINK_COMMAND_SPEC
++#define LINK_COMMAND_SPEC "\
++%{!fsyntax-only:%{!c:%{!M:%{!MM:%{!E:%{!S:\
++    %(linker) " \
++    LINK_PLUGIN_SPEC \
++   "%{flto|flto=*:%<fcompare-debug*} \
++    %{flto} %{fno-lto} %{flto=*} %l " LINK_PIE_SPEC \
++   "%{fuse-ld=*:-fuse-ld=%*} " LINK_COMPRESS_DEBUG_SPEC \
++   "%X %{o*} %{e*} %{N} %{n} %{r}\
++    %{s} %{t} %{u*} %{z} %{Z} %{!nostdlib:%{!r|mcog:%{!nostartfiles:%S}}} \
++    %{static|no-pie|static-pie:} %@{L*} %(link_libgcc) " \
++    VTABLE_VERIFICATION_SPEC " " SANITIZER_EARLY_SPEC " %o "" \
++    %{fopenacc|fopenmp|%:gt(%{ftree-parallelize-loops=*:%*} 1):\
++	%:include(libgomp.spec)%(link_gomp)}\
++    %{fgnu-tm:%:include(libitm.spec)%(link_itm)}\
++    " STACK_SPLIT_SPEC "\
++    %{fprofile-arcs|fcondition-coverage|fpath-coverage|fprofile-generate*|coverage:-lgcov} " SANITIZER_SPEC " \
++    %{!nostdlib:%{!r|mcog:%{!nodefaultlibs:%(link_ssp) %(link_gcc_c_sequence)}}}\
++    %{!nostdlib:%{!r|mcog:%{!nostartfiles:%E}}} %{T*}  \n%(post_link) }}}}}}"
++
+ #undef LINK_SPEC
+ #define LINK_SPEC "                                             \
+ %{mrelax:-relax}                                                \
+@@ -130,10 +166,8 @@
  
  #define TARGET_FLOAT_FORMAT IEEE_FLOAT_FORMAT
  
@@ -708,7 +819,7 @@ diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
  
  /* Make arrays and structures word-aligned to allow faster copying etc.  */
  #define DATA_ALIGNMENT(TYPE, ALIGN)                                     \
-@@ -152,11 +150,11 @@
+@@ -152,11 +186,11 @@
  /* Nonzero if access to memory by bytes is slow and undesirable.  */
  #define SLOW_BYTE_ACCESS 0
  
@@ -722,7 +833,7 @@ diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
  
  /* Try to generate sequences that don't involve branches, we can then use
     conditional instructions */
-@@ -183,10 +181,10 @@
+@@ -183,10 +217,10 @@
  #define LONG_TYPE_SIZE              32
  #define LONG_LONG_TYPE_SIZE         64
  
@@ -737,7 +848,7 @@ diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
  
  #define DEFAULT_SIGNED_CHAR         0
  
-@@ -405,20 +403,17 @@
+@@ -405,20 +439,17 @@
  
  /* A C expression for the number of consecutive hard registers,
     starting at register number REGNO, required to hold a value of mode
@@ -763,7 +874,7 @@ diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
  
  /* A C expression for the maximum number of consecutive registers of
     class CLASS needed to hold a value of mode MODE.  */
-@@ -429,7 +424,8 @@
+@@ -429,7 +460,8 @@
     quickly between memory and registers or between two memory
     locations.  */
  #define MOVE_MAX 4
@@ -773,7 +884,7 @@ diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
  
  /* It's faster to call directly than from registers */
  #define NO_FUNCTION_CSE 1
-@@ -465,8 +461,9 @@
+@@ -465,8 +497,9 @@
     argument of `FUNCTION_ARG' and other related values.  */
  typedef unsigned int CUMULATIVE_ARGS;
  
@@ -785,7 +896,7 @@ diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
  
  /* If defined, the maximum amount of space required for outgoing arguments
     will be computed and placed into the variable
-@@ -487,13 +484,12 @@
+@@ -487,13 +520,12 @@
  
  /* Define this macro if pushing a word onto the stack moves the stack
     pointer to a smaller address.  */
@@ -802,7 +913,7 @@ diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
  /* Offset from the stack pointer register to the first location at which
     outgoing arguments are placed */
 diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.md
---- a/gcc/config/propeller/propeller.md	2026-09-22 12:07:37.063551181 -0400
+--- a/gcc/config/propeller/propeller.md	2026-09-23 22:40:23.923832391 -0400
 +++ b/gcc/config/propeller/propeller.md	2026-09-22 10:22:55.000000000 -0400
 @@ -229,6 +229,12 @@
  (define_code_attr muxccmode [(ne "CC_Z") (eq "CC_Z") (lt "CC") (ltu "CC_C")
@@ -1313,7 +1424,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
    [(set (pc)
  	(if_then_else (match_operator 1 "ordered_comparison_operator"
 diff -urN a/gcc/config/propeller/propeller-modes.def b/gcc/config/propeller/propeller-modes.def
---- a/gcc/config/propeller/propeller-modes.def	2026-09-22 12:07:37.075127733 -0400
+--- a/gcc/config/propeller/propeller-modes.def	2026-09-23 22:40:23.934507048 -0400
 +++ b/gcc/config/propeller/propeller-modes.def	2026-09-21 10:32:19.000000000 -0400
 @@ -30,3 +30,5 @@
  CC_MODE (CCUNS);
@@ -1322,9 +1433,9 @@ diff -urN a/gcc/config/propeller/propeller-modes.def b/gcc/config/propeller/prop
 +/* set by ADDS/SUBS: the C flag holds signed overflow rather than carry */
 +CC_MODE (CC_V);
 diff -urN a/gcc/config/propeller/propeller.opt b/gcc/config/propeller/propeller.opt
---- a/gcc/config/propeller/propeller.opt	2026-09-22 12:07:37.066711759 -0400
-+++ b/gcc/config/propeller/propeller.opt	2026-09-20 23:20:02.000000000 -0400
-@@ -22,51 +22,51 @@
+--- a/gcc/config/propeller/propeller.opt	2026-09-23 22:40:23.925952487 -0400
++++ b/gcc/config/propeller/propeller.opt	2026-09-23 22:23:53.000000000 -0400
+@@ -22,56 +22,64 @@
  ; options for the propeller
  
  mspin
@@ -1388,13 +1499,26 @@ diff -urN a/gcc/config/propeller/propeller.opt b/gcc/config/propeller/propeller.
  
  Enable support for loading external code into the cog memory fcache.
  This is enabled by default in optimization levels -O2 and higher, but
+ may be disabled with an explicit -mno-fcache.
+ 
++Wcog-stack
++Target Var(warn_cog_stack) Init(0) Warning
++Warn when a function compiled for cog memory needs a stack frame.  Off by
++default, because a standalone -mcog program does get a stack from its start
++code; turn it on when building an overlay that is copied straight into a cog,
++where sp points at shared data rather than a stack and a frame would silently
++corrupt it.
++
+ mexperimental
+ Target Mask(EXPERIMENTAL)
+ Enable experimental optimizations which may or may not work correctly.
 diff -urN a/gcc/config/propeller/propeller.opt.urls b/gcc/config/propeller/propeller.opt.urls
 --- a/gcc/config/propeller/propeller.opt.urls	1969-12-31 19:00:00.000000000 -0500
 +++ b/gcc/config/propeller/propeller.opt.urls	2026-09-20 23:19:54.000000000 -0400
 @@ -0,0 +1 @@
 +; Autogenerated placeholder for propeller.opt
 diff -urN a/gcc/config/propeller/propeller-protos.h b/gcc/config/propeller/propeller-protos.h
---- a/gcc/config/propeller/propeller-protos.h	2026-09-22 12:07:37.068811337 -0400
+--- a/gcc/config/propeller/propeller-protos.h	2026-09-23 22:40:23.928211342 -0400
 +++ b/gcc/config/propeller/propeller-protos.h	2026-09-22 10:22:55.000000000 -0400
 @@ -23,7 +23,8 @@
  
@@ -1430,7 +1554,7 @@ diff -urN a/gcc/config/propeller/propeller-protos.h b/gcc/config/propeller/prope
  
  /* some variable declarations; we put them here rather than in propeller.h
 diff -urN a/libgcc/config/propeller/crtbegin.S b/libgcc/config/propeller/crtbegin.S
---- a/libgcc/config/propeller/crtbegin.S	2026-09-22 12:07:37.082372202 -0400
+--- a/libgcc/config/propeller/crtbegin.S	2026-09-23 22:40:23.941352584 -0400
 +++ b/libgcc/config/propeller/crtbegin.S	2021-07-09 13:06:19.000000000 -0400
 @@ -150,7 +150,12 @@
          mvi     r2,#__bss_end
@@ -1447,7 +1571,7 @@ diff -urN a/libgcc/config/propeller/crtbegin.S b/libgcc/config/propeller/crtbegi
  #endif
  
 diff -urN a/libgcc/config/propeller/kernel.ext b/libgcc/config/propeller/kernel.ext
---- a/libgcc/config/propeller/kernel.ext	2026-09-22 12:07:37.078660576 -0400
+--- a/libgcc/config/propeller/kernel.ext	2026-09-23 22:40:23.938123610 -0400
 +++ b/libgcc/config/propeller/kernel.ext	2026-09-20 23:41:57.000000000 -0400
 @@ -60,6 +60,7 @@
  
@@ -1458,7 +1582,7 @@ diff -urN a/libgcc/config/propeller/kernel.ext b/libgcc/config/propeller/kernel.
  	rev	r0, #0
  __CTZSI
 diff -urN a/libgcc/config/propeller/lib1funcs.asm b/libgcc/config/propeller/lib1funcs.asm
---- a/libgcc/config/propeller/lib1funcs.asm	2026-09-22 12:07:37.080768668 -0400
+--- a/libgcc/config/propeller/lib1funcs.asm	2026-09-23 22:40:23.939890348 -0400
 +++ b/libgcc/config/propeller/lib1funcs.asm	2026-09-21 01:52:09.000000000 -0400
 @@ -1104,6 +1104,11 @@
  		mov	A, r0
