@@ -13,7 +13,7 @@ follows is what is different.
 
 ## 1. Bugs fixed
 
-Nine defects in the original back end and runtime, or in how it interacts
+Ten defects in the original back end and runtime, or in how it interacts
 with current GCC.  Each is a wrong-code or crash bug, not a missed
 optimisation.
 
@@ -81,6 +81,15 @@ the ordinary return again.  A *native* naked function does not: its return is a
 named `<func>_ret` label, which such functions normally define themselves, and
 emitting a second one is a duplicate symbol error.
 
+**10. A shifted cog variable could be stored from the wrong bits.**
+`*p = v >> 24`, with `v` a cog variable and `p` a hub pointer, compiled to
+`wrbyte _v+3, ...`.  GCC narrows a shift of a memory operand into a byte or
+word access at a byte offset, which is right for hub memory; but a cog address
+counts longs, and the linker resolves `_v+3` to `_v` itself, so the store took
+bits 0-7 instead of bits 24-31 (the halfword case likewise).  Offset cog
+addresses are now accepted only in whole longs, so the narrowing is refused
+and the shift is kept.  Cog code only; the hub models were never affected.
+
 ---
 
 ## 2. New instruction support
@@ -109,6 +118,19 @@ being relied on.
 * Patterns were also added for `NEG`/`ABS` tested against their source and for
   `XOR` feeding an equality test.  These are correct but fire rarely, because
   the middle end usually sinks the arithmetic past the branch.
+* **Cog variables used in place.**  A value loaded or copied into a temporary,
+  operated on, and stored to a cog variable is now computed in the cog
+  variable itself (`rdlong _cv, _hp` / `add _cv, #1` instead of three
+  instructions).
+* **Clamps.**  `if (v > lim) v = lim` and the other orderings, on a cog
+  variable, are one `MIN`/`MAX`/`MINS`/`MAXS` instead of a compare and a
+  predicated move.
+* **Shift and rotate counts** masked with `& 31` (or any mask keeping bits
+  0-4) no longer get a separate `and`: the hardware only reads those bits.
+* **Masks.**  `0xFFFFFE00` is `andn #511` in every model (it went to the
+  constant pool in cog code).  In the hub models, a mask that is a run of low
+  or high bits is a pair of shifts, two longs, instead of `mvi` and `and`,
+  four.
 * Everything else is the GCC 16 middle end, which is 10 major releases newer
   than the original.
 
@@ -129,8 +151,17 @@ names any function this happens to:
     driver.c:300:1: warning: 'check_error' needs a 8 byte stack frame, but cog
       code has no stack unless sp is set up for it [-Wcog-stack]
 
+It looks at the code actually generated, so it also reports a naked function
+that has no frame but still spills a value through `sp`:
+
+    driver.c:120:1: warning: 'main' spills 4 bytes to the stack, but a naked
+      function has no frame and cog code has no stack unless sp is set up for it
+
 It is off by default, since a standalone cog program legitimately has a stack.
 Turn it on, with `-Werror=cog-stack` if you like, when building cog overlays.
+It is a normal `Common` warning, so `-Wno-error=cog-stack` and
+`#pragma GCC diagnostic ... "-Wcog-stack"` work on it as well, and it can be
+promoted on its own without turning the rest of `-Wall` into errors.
 
 ### Measured effect
 
@@ -145,7 +176,7 @@ On a set of four large, hand-optimised closed-source Propeller applications
 
 Because Propeller instructions are almost all fixed-time, a size reduction of
 this kind is also a speed reduction.  The cog-driver figure matters
-disproportionately: an ecog module must fit in 496 longs, and the
+disproportionately: an ecog module must fit in 492 longs, and the
 largest driver measured went from 477 longs to 453.
 
 ---

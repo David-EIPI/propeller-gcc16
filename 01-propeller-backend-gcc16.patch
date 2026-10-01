@@ -1,5 +1,5 @@
 diff -urN a/gcc/config/propeller/constraints.md b/gcc/config/propeller/constraints.md
---- a/gcc/config/propeller/constraints.md	2026-09-23 22:40:23.932440724 -0400
+--- a/gcc/config/propeller/constraints.md	2026-09-24 17:06:59.568934822 -0400
 +++ b/gcc/config/propeller/constraints.md	2026-09-22 10:20:55.000000000 -0400
 @@ -50,6 +50,20 @@
         (and (match_code "reg")
@@ -23,8 +23,8 @@ diff -urN a/gcc/config/propeller/constraints.md b/gcc/config/propeller/constrain
    "A register indirect memory operand pointing into the stack."
    (and (match_code "mem")
 diff -urN a/gcc/config/propeller/predicates.md b/gcc/config/propeller/predicates.md
---- a/gcc/config/propeller/predicates.md	2026-09-23 22:40:23.930365142 -0400
-+++ b/gcc/config/propeller/predicates.md	2026-09-21 01:40:59.000000000 -0400
+--- a/gcc/config/propeller/predicates.md	2026-09-24 17:06:59.566701017 -0400
++++ b/gcc/config/propeller/predicates.md	2026-10-01 15:37:17.000000000 -0400
 @@ -49,10 +49,18 @@
         (match_test "SYMBOL_REF_FUNCTION_P (op)")))
  
@@ -68,9 +68,22 @@ diff -urN a/gcc/config/propeller/predicates.md b/gcc/config/propeller/predicates
  ;; for addition we can also do negative immediates
  (define_predicate "propeller_add_operand"
    (ior (match_operand 0 "propeller_src_operand")
+@@ -111,6 +130,12 @@
+ (define_special_predicate "propeller_math_op1"
+   (match_code "neg,not,abs"))
+ 
++;; Two-operand operations whose patterns all take a cog variable as the
++;; destination ("=rC" tied to "0") and a propeller_src_operand as the source,
++;; so "D = D <op> S" can be done in cog memory directly.
++(define_special_predicate "propeller_cogrmw_op"
++  (match_code "plus,minus,and,ior,xor,ashift,lshiftrt,ashiftrt,rotate,rotatert,umin,umax,smin,smax"))
++
+ ;; true if this operator is a math operator with 1 argument that
+ ;; sets flags based on source
+ (define_special_predicate "propeller_math_op1srcflags"
 diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.cc
---- a/gcc/config/propeller/propeller.cc	2026-09-23 22:40:23.919214970 -0400
-+++ b/gcc/config/propeller/propeller.cc	2026-09-23 22:17:22.000000000 -0400
+--- a/gcc/config/propeller/propeller.cc	2026-09-24 17:06:59.555517299 -0400
++++ b/gcc/config/propeller/propeller.cc	2026-10-01 15:27:34.000000000 -0400
 @@ -20,79 +20,52 @@
     along with GCC; see the file COPYING3.  If not see
     <http://www.gnu.org/licenses/>.  */
@@ -229,7 +242,29 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
  };
  
  /*
-@@ -551,6 +542,41 @@
+@@ -510,11 +501,20 @@
+   print_rtl_single (stdout, x);
+   printf("\n");
+ #endif
+-  if (!TARGET_LMM 
++  /* Cog memory is addressed in longs: the linker divides a cog symbol's byte
++     address by 4, so "sym+N" names a different register only when N is a
++     multiple of 4, and "sym+3" is just "sym" again.  The middle end narrows
++     e.g. (lshiftrt:SI (mem:SI sym) 24) into (mem:QI sym+3), which is right
++     for byte-addressable hub memory but here reads bits 0-7 of the register
++     instead of bits 24-31.  Refusing sub-word offsets makes such a narrowed
++     reference illegitimate, so the passes that try it (simplify-rtx through
++     fwprop, combine) re-validate, fail and keep the shift.  */
++  if (!TARGET_LMM
+       && ( code == LABEL_REF
+            || (code == CONST
+                && GET_CODE (XEXP (x, 0)) == PLUS
+                && GET_CODE (XEXP (XEXP (x, 0), 1)) == CONST_INT
++               && INTVAL (XEXP (XEXP (x, 0), 1)) % UNITS_PER_WORD == 0
+                && propeller_cogaddr_p (XEXP (XEXP (x, 0), 0)) ) ))
+     {
+       return true;
+@@ -551,6 +551,205 @@
  }
  
  /*
@@ -268,10 +303,174 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
 +}
 +
 +/*
++ * Recognise a clamp done as a compare and a conditional move,
++ *
++ *     operands[1] <=> operands[2]          (the compare, setting cc)
++ *     if (cond) operands[4] = operands[5]  (the move, cc dead after)
++ *
++ * where the move target is one side of the compare and the value it gets is
++ * the other: that is "D = min/max (D, X)", one MIN/MAX/MINS/MAXS.  The
++ * middle end does this itself when D is a register, but a cog variable is
++ * memory to it, and it will not turn a conditional store into an
++ * unconditional one; the cond_exec only appears after reload.  "D >= c" with
++ * a constant is canonicalised to "D > c-1", so also accept the value being
++ * one past the compared constant in the direction of the test.  On success
++ * set operands[6] to the min/max rtx and return true.
++ */
++bool
++propeller_cond_move_to_minmax (rtx *operands)
++{
++  rtx cc = operands[0];
++  rtx d = operands[4], v = operands[5], x;
++  enum rtx_code code = GET_CODE (operands[3]), mm;
++
++  if (!REG_P (cc) || REGNO (cc) != CC_REG)
++    return false;
++  if (MEM_P (d) && MEM_VOLATILE_P (d))
++    return false;
++
++  if (rtx_equal_p (operands[1], d))
++    x = operands[2];
++  else if (rtx_equal_p (operands[2], d))
++    {
++      x = operands[1];
++      code = swap_condition (code);
++    }
++  else
++    return false;
++
++  /* Now the move reads "if (D <code> X) D = V".  */
++  if (!rtx_equal_p (x, v))
++    {
++      if (!CONST_INT_P (x) || !CONST_INT_P (v))
++	return false;
++      if ((code == GT || code == GTU) && INTVAL (v) == INTVAL (x) + 1)
++	code = (code == GT) ? GE : GEU;
++      else if ((code == LT || code == LTU) && INTVAL (v) == INTVAL (x) - 1)
++	code = (code == LT) ? LE : LEU;
++      else
++	return false;
++    }
++
++  switch (code)
++    {
++    case LTU: case LEU: mm = UMAX; break;	/* D below V: raise it to V */
++    case GTU: case GEU: mm = UMIN; break;	/* D above V: lower it to V */
++    case LT:  case LE:  mm = SMAX; break;
++    case GT:  case GE:  mm = SMIN; break;
++    default:
++      return false;
++    }
++
++  operands[6] = gen_rtx_fmt_ee (mm, SImode, copy_rtx (d), v);
++  return true;
++}
++
++/* The symbol a direct cog memory address is based on, or NULL.  */
++static rtx
++propeller_cogaddr_base (rtx addr)
++{
++  if (GET_CODE (addr) == CONST && GET_CODE (XEXP (addr, 0)) == PLUS)
++    addr = XEXP (XEXP (addr, 0), 0);
++  if (GET_CODE (addr) == SYMBOL_REF || GET_CODE (addr) == LABEL_REF)
++    return addr;
++  return NULL_RTX;
++}
++
++/* Whether X may read or write the cog variable M.  Hub memory is a separate
++   memory, so only cog memory references can; of those, a different symbol
++   is a different variable.  (reg_overlap_mentioned_p cannot be used here: it
++   treats any MEM as overlapping any other.)  */
++static bool
++propeller_cogvar_mentioned_p (rtx m, rtx x)
++{
++  rtx mbase = propeller_cogaddr_base (XEXP (m, 0));
++  subrtx_iterator::array_type array;
++
++  FOR_EACH_SUBRTX (iter, array, x, ALL)
++    {
++      const_rtx sub = *iter;
++      if (!MEM_P (sub) || !propeller_cogmem_p (const_cast<rtx> (sub)))
++	continue;
++      rtx base = propeller_cogaddr_base (XEXP (sub, 0));
++      if (!mbase || !base || rtx_equal_p (mbase, base))
++	return true;
++    }
++  return false;
++}
++
++/*
++ * Test whether
++ *
++ *     tmp = src
++ *     tmp = tmp <op1> b1
++ *    [tmp = tmp <op2> b2]
++ *     m = tmp                  (tmp dead after)
++ *
++ * can be done in the cog variable M itself,
++ *
++ *     m = src
++ *     m = m <op1> b1
++ *    [m = m <op2> b2]
++ *
++ * which saves the final mov.  TMP is a register; M must be a non-volatile
++ * cog variable (a volatile one, e.g. OUTA, must not see the intermediate
++ * values), and neither the operands of the ops nor the initial value may
++ * read M or, for the ops, TMP.  B2 is NULL for the one-op form.
++ */
++bool
++propeller_cogvar_rmw_ok (rtx tmp, rtx src, rtx m, rtx b1, rtx b2)
++{
++  if (!MEM_P (m) || MEM_VOLATILE_P (m) || !propeller_cogmem_p (m))
++    return false;
++  if (reg_overlap_mentioned_p (tmp, b1)
++      || propeller_cogvar_mentioned_p (m, b1)
++      || propeller_cogvar_mentioned_p (m, src))
++    return false;
++  if (b2 && (reg_overlap_mentioned_p (tmp, b2)
++	     || propeller_cogvar_mentioned_p (m, b2)))
++    return false;
++  /* The initial value is moved straight into cog memory, so it has to be
++     something a mov or rdlong can put there.  Outside XMM, *movsi offers a
++     cog destination exactly the sources it offers a register one; a memory
++     source is read once either way, so its volatility does not matter.  */
++  if (MEM_P (src))
++    return true;
++  return propeller_src_operand (src, SImode);
++}
++
++/*
++ * Whether an AND mask is better done with a pair of shifts in the hub
++ * memory models (see *andsi3_shiftmask): a run of low bits 2^n-1 or of high
++ * bits -2^n that "and #imm"/"andn #imm" cannot encode.  0xFFFF is left out:
++ * the zero-extend patterns do it in one long against the kernel's
++ * __MASK_0000FFFF.
++ */
++bool
++propeller_shiftmask_p (rtx op)
++{
++  unsigned HOST_WIDE_INT m;
++  int n;
++
++  if (!CONST_INT_P (op))
++    return false;
++  if (INTVAL (op) >= -512 && INTVAL (op) <= 511)
++    return false;
++  m = UINTVAL (op) & 0xffffffff;
++  if (m == 0xffff)
++    return false;
++  n = exact_log2 (m + 1);
++  if (n > 0 && n < 32)
++    return true;
++  n = exact_log2 ((~m + 1) & 0xffffffff);
++  return n > 0 && n < 32;
++}
++
++/*
   * test whether this operand is known to be memory pointing into the stack
   */
  bool
-@@ -1106,7 +1132,7 @@
+@@ -1106,7 +1305,7 @@
    else if (code == HIGH)
      output_addr_const (file, XEXP (op, 0));  
    else if (code == MEM)
@@ -280,7 +479,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
    else if (code == CONST_DOUBLE)
      {
        if ((CONST_DOUBLE_LOW (op) != 0) || (CONST_DOUBLE_HIGH (op) != 0))
-@@ -1143,7 +1169,8 @@
+@@ -1143,7 +1342,8 @@
     into the `symbol_ref', and then check for it here.  */
  
  void
@@ -290,7 +489,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
  {
    switch (GET_CODE (addr))
      {
-@@ -1152,7 +1179,7 @@
+@@ -1152,7 +1352,7 @@
        break;
  
      case MEM:
@@ -299,7 +498,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
        break;
  
      case SYMBOL_REF:
-@@ -1202,11 +1229,25 @@
+@@ -1202,11 +1402,25 @@
   * check for legitimate addresses
   */
  bool
@@ -326,7 +525,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
    if (REG_P (addr)) {
      return INT_REG_OK_FOR_BASE_P (addr, strict);
    }
-@@ -1254,8 +1295,12 @@
+@@ -1254,8 +1468,12 @@
     Speed-relative costs are relative to COSTS_N_INSNS, which is intended
     to represent cycles.  Size-relative costs are in words.  */
  static bool
@@ -340,7 +539,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
      switch (code) {
      case REG:
      case SUBREG:
-@@ -1306,6 +1351,8 @@
+@@ -1306,6 +1524,8 @@
      case MEM:
        if (TARGET_XMM)
  	*total += COSTS_N_INSNS(20); /* memory is hideously expensive in XMM mode */
@@ -349,7 +548,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
        else
  	*total += COSTS_N_INSNS(4);  /* and moderately expensive in non-COG mdoes */
        break;
-@@ -1393,29 +1440,29 @@
+@@ -1393,29 +1613,29 @@
      (otherwise it is an extra parameter matching an ellipsis).  */
  
  static rtx
@@ -388,7 +587,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
  }
  
  /*
-@@ -1596,6 +1643,22 @@
+@@ -1596,6 +1816,22 @@
    return code;
  }
  
@@ -411,7 +610,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
  /*
   * generate CC_REG in appropriate mode
   */
-@@ -1901,11 +1964,7 @@
+@@ -1901,11 +2137,7 @@
        destlo = gen_lowpart (SImode, dest);
        desthi = gen_highpart (SImode, dest);
        srcreg = XEXP (src, 0);
@@ -424,7 +623,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
        srcindirect = gen_rtx_MEM (SImode, srcreg);
  
        if (true_regnum (srcreg) == true_regnum (destlo)) {
-@@ -1946,14 +2005,13 @@
+@@ -1946,14 +2178,13 @@
    vector = gen_rtx_PARALLEL (VOIDmode, rtvec_alloc (count));
  
    XVECEXP (vector, 0, 0) =
@@ -441,7 +640,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
                                  gen_rtx_MINUS (SImode, stack_pointer_rtx,
                                                 GEN_INT ((i + 1) * UNITS_PER_WORD))),
                     gen_rtx_REG (SImode, low + i));
-@@ -1973,14 +2031,13 @@
+@@ -1973,14 +2204,13 @@
    vector = gen_rtx_PARALLEL (VOIDmode, rtvec_alloc (count));
  
    XVECEXP (vector, 0, 0) =
@@ -458,7 +657,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
                     gen_rtx_MEM (SImode,
                                  i == 0 ? stack_pointer_rtx
                                  : plus_constant (Pmode, stack_pointer_rtx,
-@@ -2255,6 +2312,23 @@
+@@ -2255,6 +2485,23 @@
  
    propeller_compute_frame_info ();
  
@@ -482,7 +681,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
    if (cfun->machine->frame.total_size > 0)
      {
        /* Save callee save registers.  */
-@@ -2306,12 +2380,38 @@
+@@ -2306,12 +2553,38 @@
    if (is_naked_function (current_function_decl))
    {
        gcc_assert(! is_sibcall);
@@ -526,7 +725,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
    }
    propeller_compute_frame_info ();
  
-@@ -3597,10 +3697,11 @@
+@@ -3597,10 +3870,11 @@
                   but now we need it to go to the end of the
                   fcache section
                */
@@ -541,7 +740,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
  
                const_label = gen_label_rtx ();
                LABEL_NUSES (const_label)++;
-@@ -3608,7 +3709,7 @@
+@@ -3608,7 +3882,7 @@
  
                last = emit_label_after (const_label, last);
                INSN_ADDRESSES_NEW (last, -1);
@@ -550,7 +749,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
                mode = GET_MODE (SET_DEST (pattern));
                /* now the actual word */
                const_insn = gen_fcache_const_word (SET_SRC (pattern));
-@@ -3617,7 +3718,7 @@
+@@ -3617,7 +3891,7 @@
  
                /* finally, modify the existing move instruction */
                /* update the pattern */
@@ -559,7 +758,163 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
                emit_insn_before (pattern, mov_insn);
                /* delete the old one */
                delete_insn (mov_insn);
-@@ -3988,6 +4089,200 @@
+@@ -3856,12 +4130,155 @@
+  * optimizations
+  */
+ 
++/*
++ * -Wcog-stack, second half.  The prologue reports a function that allocates
++ * a frame, but a stack can be used without one: a naked function gets no
++ * prologue at all, yet reload still gives it spill slots addressed through
++ * sp.  In a cog driver sp usually holds PAR, so such a spill silently
++ * overwrites the start of the driver's parameter block.  Look at what was
++ * actually emitted and report any remaining sp reference.
++ */
++static void
++propeller_check_cog_stack (void)
++{
++  rtx_insn *insn;
++  rtx hardfp = gen_rtx_REG (Pmode, PROP_FP_REGNUM);
++  bool naked = is_naked_function (current_function_decl);
++
++  if (!warn_cog_stack || TARGET_LMM || TARGET_XMM)
++    return;
++
++  /* A function with a frame has already been reported by the prologue.  */
++  if (!naked && cfun->machine->frame.total_size > 0)
++    return;
++
++  for (insn = get_insns (); insn; insn = NEXT_INSN (insn))
++    {
++      if (!NONDEBUG_INSN_P (insn))
++	continue;
++      if (!reg_mentioned_p (stack_pointer_rtx, PATTERN (insn))
++	  && !(frame_pointer_needed
++	       && reg_mentioned_p (hardfp, PATTERN (insn))))
++	continue;
++
++      if (naked && get_frame_size () > 0)
++	warning (OPT_Wcog_stack,
++		 "%qD spills %wd bytes to the stack, but a naked function has "
++		 "no frame and cog code has no stack unless sp is set up for it",
++		 current_function_decl, (HOST_WIDE_INT) get_frame_size ());
++      else
++	warning (OPT_Wcog_stack,
++		 "%qD uses the stack pointer, but cog code has no stack "
++		 "unless sp is set up for it", current_function_decl);
++      return;
++    }
++}
++
++/* Whether the flags are dead after INSN.  Scan forward along the
++   fall-through path: a read means live, an unconditional write means dead,
++   leaving the function means dead.  Anything whose successors cannot be
++   followed from here (a branch, a call) is taken as live.  */
++static bool
++propeller_cc_dead_after_p (rtx_insn *insn)
++{
++  rtx cc = gen_rtx_REG (CCmode, CC_REG);
++  rtx_insn *i;
++
++  for (i = NEXT_INSN (insn); i; i = NEXT_INSN (i))
++    {
++      if (!NONDEBUG_INSN_P (i))
++	continue;		/* labels and notes do not change liveness */
++      if (reg_referenced_p (cc, PATTERN (i)))
++	return false;
++      if (JUMP_P (i))
++	return returnjump_p (i);
++      if (CALL_P (i))
++	return false;
++      if (GET_CODE (PATTERN (i)) != COND_EXEC && reg_set_p (cc, i))
++	return true;
++    }
++  return true;
++}
++
++/* Turn a compare and a predicated mov that clamp a value into one
++   MIN/MAX/MINS/MAXS; see propeller_cond_move_to_minmax.  This has to run
++   after post-reload if-conversion, which is what creates the cond_exec, so
++   it cannot be a peephole2.  */
++static void
++propeller_cond_moves_to_minmax (void)
++{
++  rtx_insn *insn, *next;
++
++  for (insn = get_insns (); insn; insn = next)
++    {
++      rtx ops[7], set, ce_pat, test, mv;
++      rtx_insn *ce, *n;
++
++      next = NEXT_INSN (insn);
++      if (!NONJUMP_INSN_P (insn))
++	continue;
++      set = PATTERN (insn);
++      if (GET_CODE (set) != SET
++	  || !REG_P (SET_DEST (set)) || REGNO (SET_DEST (set)) != CC_REG
++	  || GET_CODE (SET_SRC (set)) != COMPARE)
++	continue;
++
++      ce = next_nonnote_nondebug_insn (insn);
++      if (!ce || !NONJUMP_INSN_P (ce) || GET_CODE (PATTERN (ce)) != COND_EXEC)
++	continue;
++      ce_pat = PATTERN (ce);
++      test = COND_EXEC_TEST (ce_pat);
++      mv = COND_EXEC_CODE (ce_pat);
++      if (GET_CODE (mv) != SET || GET_MODE (SET_DEST (mv)) != SImode
++	  || !REG_P (XEXP (test, 0)) || REGNO (XEXP (test, 0)) != CC_REG
++	  || XEXP (test, 1) != const0_rtx)
++	continue;
++
++      ops[0] = SET_DEST (set);
++      ops[1] = XEXP (SET_SRC (set), 0);
++      ops[2] = XEXP (SET_SRC (set), 1);
++      ops[3] = test;
++      ops[4] = SET_DEST (mv);
++      ops[5] = SET_SRC (mv);
++      if (!propeller_src_operand (ops[1], SImode)
++	  || !propeller_src_operand (ops[2], SImode)
++	  || !propeller_dst_operand (ops[4], SImode)
++	  || !propeller_src_operand (ops[5], SImode))
++	continue;
++      if (!propeller_cond_move_to_minmax (ops) || !propeller_cc_dead_after_p (ce))
++	continue;
++
++      n = emit_insn_after (gen_rtx_SET (copy_rtx (ops[4]), ops[6]), ce);
++      if (recog_memoized (n) < 0)
++	{
++	  delete_insn (n);
++	  continue;
++	}
++      extract_insn (n);
++      if (!constrain_operands (1, get_preferred_alternatives (n)))
++	{
++	  delete_insn (n);
++	  continue;
++	}
++      if (dump_file)
++	fprintf (dump_file, " *** insns %d,%d -> min/max insn %d\n",
++		 INSN_UID (insn), INSN_UID (ce), INSN_UID (n));
++      delete_insn (insn);
++      delete_insn (ce);
++      next = NEXT_INSN (n);
++    }
++}
++
+ static void
+ propeller_reorg(void)
+ {
+   bool done = 0;
+   bool fcache_func = is_fcache_function (current_function_decl);
+ 
++  propeller_check_cog_stack ();
++  if (optimize)
++    propeller_cond_moves_to_minmax ();
++
+   /* handle FCACHE */
+   if (TARGET_LMM && (do_fcache || fcache_func))
+     {
+@@ -3988,6 +4405,200 @@
  #undef TARGET_LRA_P
  #define TARGET_LRA_P propeller_lra_p
  
@@ -761,7 +1116,7 @@ diff -urN a/gcc/config/propeller/propeller.cc b/gcc/config/propeller/propeller.c
  
  #include "gt-propeller.h"
 diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
---- a/gcc/config/propeller/propeller.h	2026-09-23 22:40:23.921624337 -0400
+--- a/gcc/config/propeller/propeller.h	2026-09-24 17:06:59.557763779 -0400
 +++ b/gcc/config/propeller/propeller.h	2026-09-23 22:08:18.000000000 -0400
 @@ -52,6 +52,42 @@
    }                                             \
@@ -913,8 +1268,8 @@ diff -urN a/gcc/config/propeller/propeller.h b/gcc/config/propeller/propeller.h
  /* Offset from the stack pointer register to the first location at which
     outgoing arguments are placed */
 diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.md
---- a/gcc/config/propeller/propeller.md	2026-09-23 22:40:23.923832391 -0400
-+++ b/gcc/config/propeller/propeller.md	2026-09-22 10:22:55.000000000 -0400
+--- a/gcc/config/propeller/propeller.md	2026-09-24 17:06:59.560222515 -0400
++++ b/gcc/config/propeller/propeller.md	2026-10-01 15:37:27.000000000 -0400
 @@ -229,6 +229,12 @@
  (define_code_attr muxccmode [(ne "CC_Z") (eq "CC_Z") (lt "CC") (ltu "CC_C")
                               (ge "CC") (geu "CC_C")])
@@ -1025,10 +1380,11 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
  (define_insn "*<oneop:code>si2_compare0"
    [
      (set (reg:CC_Z CC_REG)
-@@ -781,6 +870,34 @@
+@@ -781,7 +870,65 @@
    [(set_attr "predicable" "yes")]
  )
  
+-(define_insn "andsi3"
 +;; "andn" sets Z from its result too, so a following test for zero is
 +;; redundant.
 +(define_insn "*andnotsi3_compare0"
@@ -1057,10 +1413,83 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
 +   (set_attr "predicable" "yes")]
 +)
 +
- (define_insn "andsi3"
++;; In cog mode legitimate_constant_p stops at -511, because -512 cannot be
++;; loaded into a register in one instruction, so propeller_and_operand turns
++;; 0xFFFFFE00 away and it would go to the constant pool - although it is
++;; exactly "andn #511".  It cannot simply be accepted as an operand: reload
++;; may then pick the register alternative and try to move -512 into a
++;; register, which nothing can do.  So it gets an insn of its own with the
++;; constant written into the pattern, where reload never sees an operand to
++;; move, and the expander routes it there.
++(define_expand "andsi3"
++  [(set (match_operand:SI         0 "propeller_dst_operand" "")
++	(and:SI (match_operand:SI 1 "propeller_dst_operand" "")
++		(match_operand:SI 2 "general_operand" "")))]
++  ""
++{
++  if (CONST_INT_P (operands[2])
++      && (INTVAL (operands[2]) & 0xffffffff) == 0xfffffe00)
++    operands[2] = GEN_INT (-512);
++  else if (!propeller_and_operand (operands[2], SImode))
++    operands[2] = force_reg (SImode, operands[2]);
++})
++
++(define_insn "*andsi3_notmask511"
++  [(set (match_operand:SI         0 "propeller_dst_operand" "=rC")
++	(and:SI (match_operand:SI 1 "propeller_dst_operand" "0")
++		(const_int -512)))]
++  ""
++  "andn\t%0, #511"
++  [(set_attr "predicable" "yes")]
++)
++
++(define_insn "*andsi3"
    [(set (match_operand:SI         0 "propeller_dst_operand" "=rC,rC")
  	(and:SI (match_operand:SI 1 "propeller_dst_operand" "%0,0")
-@@ -928,6 +1045,21 @@
+ 		(match_operand:SI 2 "propeller_and_operand" " rCI,M")))]
+@@ -792,6 +939,41 @@
+   [(set_attr "predicable" "yes")]
+ )
+ 
++;; In the hub memory models a mask that fits neither "and #imm" nor
++;; "andn #imm" costs an mvi (two longs) and usually a copy as well.  When the
++;; mask is a run of low bits (2^n-1) or of high bits (-2^n), a pair of shifts
++;; does it in two longs with no constant at all.  Cog code keeps the pool
++;; constant: there "and r, .LC" plus its long is also two longs but one
++;; instruction, and the long can be shared.
++(define_insn_and_split "*andsi3_shiftmask"
++  [(set (match_operand:SI         0 "register_operand" "=r")
++	(and:SI (match_operand:SI 1 "register_operand" "0")
++		(match_operand:SI 2 "const_int_operand" "n")))]
++  "TARGET_LMM && propeller_shiftmask_p (operands[2])"
++  "#"
++  "&& 1"
++  [(const_int 0)]
++{
++  unsigned HOST_WIDE_INT m = UINTVAL (operands[2]) & 0xffffffff;
++  int low = exact_log2 (m + 1);			/* m = 2^low - 1 */
++  rtx dst = operands[0], src = operands[1];
++  rtx t = can_create_pseudo_p () ? gen_reg_rtx (SImode) : dst;
++
++  if (low > 0)
++    {
++      rtx k = GEN_INT (32 - low);
++      emit_insn (gen_rtx_SET (t, gen_rtx_ASHIFT (SImode, src, k)));
++      emit_insn (gen_rtx_SET (dst, gen_rtx_LSHIFTRT (SImode, t, k)));
++    }
++  else
++    {
++      rtx k = GEN_INT (exact_log2 ((~m + 1) & 0xffffffff));	/* m = -2^k */
++      emit_insn (gen_rtx_SET (t, gen_rtx_LSHIFTRT (SImode, src, k)));
++      emit_insn (gen_rtx_SET (dst, gen_rtx_ASHIFT (SImode, t, k)));
++    }
++  DONE;
++})
++
+ ;; versions that check against 0
+ (define_insn "*andsi3_compare0"
+   [(set (reg:CC_Z CC_REG)
+@@ -928,6 +1110,21 @@
    [(set_attr "predicable" "yes")]
  )
  
@@ -1082,7 +1511,28 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
  (define_insn "*<orop:code>si3_compare0_only"
    [(set (reg:CC_Z CC_REG)
          (compare:CC_Z
-@@ -1219,7 +1351,7 @@
+@@ -1007,6 +1204,20 @@
+   [(set_attr "predicable" "yes")]
+ )
+ 
++;; The shift and rotate instructions use only bits 0-4 of the count, so a
++;; mask of the count that keeps those bits - the "n & 31" a portable rotate
++;; or a guarded shift has to write - is already done by the hardware.
++(define_insn "*<shiftop:code>si3_mask"
++  [(set (match_operand:SI 0 "propeller_dst_operand" "=rC")
++	(shiftop:SI
++	  (match_operand:SI 1 "propeller_dst_operand" "0")
++	  (and:SI (match_operand:SI 2 "propeller_dst_operand" "rC")
++		  (match_operand:SI 3 "const_int_operand" "n"))))]
++  "(INTVAL (operands[3]) & 31) == 31"
++  "<opcode>\t%0, %2"
++  [(set_attr "predicable" "yes")]
++)
++
+ ;; patterns to compare with 0
+ (define_insn "*<shiftop:code>si3_compare0"
+   [(set (reg:CC_Z CC_REG)
+@@ -1219,7 +1430,7 @@
  
  (define_insn "*movsi"
    [(set (match_operand:SI 0 "nonimmediate_operand"          "=rC,rC,rC,rC,m")
@@ -1091,7 +1541,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
    "!TARGET_XMM"
    "@
     mov\t%0, %1
-@@ -1255,6 +1387,36 @@
+@@ -1255,6 +1466,36 @@
    [(set_attr "conds" "set")
     (set_attr "predicable" "yes")]
  )
@@ -1128,7 +1578,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
  (define_insn "*movsi_compare0_flip"
    [(set (match_operand:SI 0 "propeller_dst_operand" "=rC")
  	(match_operand:SI 1 "propeller_src_operand" "rCI"))
-@@ -1290,6 +1452,152 @@
+@@ -1290,6 +1531,152 @@
  )
  
  
@@ -1281,7 +1731,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
  (define_expand "movhi"
    [(set (match_operand:HI 0 "nonimmediate_operand" "")
  	(match_operand:HI 1 "general_operand" ""))]
-@@ -1333,7 +1641,7 @@
+@@ -1333,7 +1720,7 @@
  
  (define_insn "*movhi_xmm"
    [(set (match_operand:HI 0 "nonimmediate_operand"          "=rC,rC,rC,S,r,m")
@@ -1290,7 +1740,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
    "TARGET_XMM"
    "@
     mov\t%0, %1
-@@ -1350,7 +1658,7 @@
+@@ -1350,7 +1737,7 @@
  
  (define_insn "*movhi"
    [(set (match_operand:HI 0 "nonimmediate_operand"          "=rC,rC,rC,m")
@@ -1299,7 +1749,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
    "!TARGET_XMM"
    "@
     mov\t%0, %1
-@@ -1375,7 +1683,7 @@
+@@ -1375,7 +1762,7 @@
  
  (define_insn "*movqi_xmm"
    [(set (match_operand:QI 0 "nonimmediate_operand"          "=rC,rC,rC,S,r,m")
@@ -1308,7 +1758,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
    "TARGET_XMM"
    "@
     mov\t%0, %1
-@@ -1392,7 +1700,7 @@
+@@ -1392,7 +1779,7 @@
  
  (define_insn "*movqi"
    [(set (match_operand:QI 0 "nonimmediate_operand"   "=rC,rC,rC,m")
@@ -1317,7 +1767,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
    "!TARGET_XMM"
    "@
     mov\t%0, %1
-@@ -1635,22 +1943,19 @@
+@@ -1635,22 +2022,19 @@
  "")
  
  ;;
@@ -1353,7 +1803,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
  ;; -------------------------------------------------------------------------
  ;; min/max instructions
  ;; NOTE!! The Propeller instruction names are the reverse of what one
-@@ -1738,7 +2043,7 @@
+@@ -1738,7 +2122,7 @@
      mode = GET_MODE (ccreg);
  
      /* we have to actually emit the compare! */
@@ -1362,7 +1812,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
      operands[1] = gen_rtx_fmt_ee (code, VOIDmode, ccreg, const0_rtx);
    }"
  )
-@@ -1916,8 +2221,8 @@
+@@ -1916,8 +2300,8 @@
  (define_insn "cmpdi_signed"
    [(set (reg:CC CC_REG)
  	(compare:CC
@@ -1373,7 +1823,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
    ""
    "cmp\\t%Q0, %Q1 wz,wc\n\\tcmpsx\\t%R0, %R1 wz,wc"
    [(set_attr "length" "8")
-@@ -1928,8 +2233,8 @@
+@@ -1928,8 +2312,8 @@
  (define_insn "cmpdi_unsigned"
    [(set (reg:CCUNS CC_REG)
  	(compare:CCUNS
@@ -1384,7 +1834,7 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
    ""
    "cmp\\t%Q0, %Q1 wz,wc\n\\tcmpx\\t%R0, %R1 wz,wc"
    [(set_attr "length" "8")
-@@ -2000,6 +2305,38 @@
+@@ -2000,6 +2384,38 @@
  ]
  )
  
@@ -1423,8 +1873,68 @@ diff -urN a/gcc/config/propeller/propeller.md b/gcc/config/propeller/propeller.m
  (define_insn "*condbranch_reverse"
    [(set (pc)
  	(if_then_else (match_operator 1 "ordered_comparison_operator"
+@@ -3293,6 +3709,59 @@
+   ""
+ )
+ 
++;; Arithmetic whose result lands in a cog variable is done in a temporary
++;; and copied back:
++;;	rdlong	r7, _hp
++;;	add	r7, #1
++;;	mov	_cv, r7
++;; when the cog variable can take both steps itself:
++;;	rdlong	_cv, _hp
++;;	add	_cv, #1
++(define_peephole2
++  [(set (match_operand:SI 0 "register_operand" "")
++	(match_operand:SI 1 "general_operand" ""))
++   (set (match_dup 0)
++	(match_operator:SI 2 "propeller_cogrmw_op"
++	  [(match_dup 0)
++	   (match_operand:SI 3 "propeller_src_operand" "")]))
++   (set (match_operand:SI 4 "propeller_dst_operand" "")
++	(match_dup 0))]
++  "!TARGET_XMM
++   && peep2_reg_dead_p (3, operands[0])
++   && propeller_cogvar_rmw_ok (operands[0], operands[1], operands[4],
++			       operands[3], NULL_RTX)"
++  [(set (match_dup 4) (match_dup 1))
++   (set (match_dup 4)
++	(match_op_dup 2 [(match_dup 4) (match_dup 3)]))]
++  ""
++)
++
++;; The same with two operations before the copy back.
++(define_peephole2
++  [(set (match_operand:SI 0 "register_operand" "")
++	(match_operand:SI 1 "general_operand" ""))
++   (set (match_dup 0)
++	(match_operator:SI 2 "propeller_cogrmw_op"
++	  [(match_dup 0)
++	   (match_operand:SI 3 "propeller_src_operand" "")]))
++   (set (match_dup 0)
++	(match_operator:SI 5 "propeller_cogrmw_op"
++	  [(match_dup 0)
++	   (match_operand:SI 6 "propeller_src_operand" "")]))
++   (set (match_operand:SI 4 "propeller_dst_operand" "")
++	(match_dup 0))]
++  "!TARGET_XMM
++   && peep2_reg_dead_p (4, operands[0])
++   && propeller_cogvar_rmw_ok (operands[0], operands[1], operands[4],
++			       operands[3], operands[6])"
++  [(set (match_dup 4) (match_dup 1))
++   (set (match_dup 4)
++	(match_op_dup 2 [(match_dup 4) (match_dup 3)]))
++   (set (match_dup 4)
++	(match_op_dup 5 [(match_dup 4) (match_dup 6)]))]
++  ""
++)
++
+ ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+ ;; old-style peepholes: these work at the very end of compilation
+ ;; and can occasionally catch issues that are missed by earlier
 diff -urN a/gcc/config/propeller/propeller-modes.def b/gcc/config/propeller/propeller-modes.def
---- a/gcc/config/propeller/propeller-modes.def	2026-09-23 22:40:23.934507048 -0400
+--- a/gcc/config/propeller/propeller-modes.def	2026-09-24 17:06:59.571105750 -0400
 +++ b/gcc/config/propeller/propeller-modes.def	2026-09-21 10:32:19.000000000 -0400
 @@ -30,3 +30,5 @@
  CC_MODE (CCUNS);
@@ -1433,9 +1943,9 @@ diff -urN a/gcc/config/propeller/propeller-modes.def b/gcc/config/propeller/prop
 +/* set by ADDS/SUBS: the C flag holds signed overflow rather than carry */
 +CC_MODE (CC_V);
 diff -urN a/gcc/config/propeller/propeller.opt b/gcc/config/propeller/propeller.opt
---- a/gcc/config/propeller/propeller.opt	2026-09-23 22:40:23.925952487 -0400
-+++ b/gcc/config/propeller/propeller.opt	2026-09-23 22:23:53.000000000 -0400
-@@ -22,56 +22,64 @@
+--- a/gcc/config/propeller/propeller.opt	2026-09-24 17:06:59.562456278 -0400
++++ b/gcc/config/propeller/propeller.opt	2026-09-24 17:00:10.000000000 -0400
+@@ -22,56 +22,71 @@
  ; options for the propeller
  
  mspin
@@ -1501,8 +2011,15 @@ diff -urN a/gcc/config/propeller/propeller.opt b/gcc/config/propeller/propeller.
  This is enabled by default in optimization levels -O2 and higher, but
  may be disabled with an explicit -mno-fcache.
  
++;; Classified Common, not Target, deliberately.  A Target option is dispatched
++;; through target_handle_option(), which asserts that the diagnostic kind is
++;; "unspecified"; -Werror=cog-stack passes a kind and trips that assert, and a
++;; Target option also carries no language mask, so "#pragma GCC diagnostic ...
++;; -Wcog-stack" is rejected as "valid for  but not for C".  Common routes it
++;; through common_handle_option(), which takes the kind, so -Wcog-stack,
++;; -Werror=cog-stack, -Wno-error=cog-stack and the pragmas all work.
 +Wcog-stack
-+Target Var(warn_cog_stack) Init(0) Warning
++Common Var(warn_cog_stack) Init(0) Warning
 +Warn when a function compiled for cog memory needs a stack frame.  Off by
 +default, because a standalone -mcog program does get a stack from its start
 +code; turn it on when building an overlay that is copied straight into a cog,
@@ -1518,8 +2035,8 @@ diff -urN a/gcc/config/propeller/propeller.opt.urls b/gcc/config/propeller/prope
 @@ -0,0 +1 @@
 +; Autogenerated placeholder for propeller.opt
 diff -urN a/gcc/config/propeller/propeller-protos.h b/gcc/config/propeller/propeller-protos.h
---- a/gcc/config/propeller/propeller-protos.h	2026-09-23 22:40:23.928211342 -0400
-+++ b/gcc/config/propeller/propeller-protos.h	2026-09-22 10:22:55.000000000 -0400
+--- a/gcc/config/propeller/propeller-protos.h	2026-09-24 17:06:59.564642835 -0400
++++ b/gcc/config/propeller/propeller-protos.h	2026-10-01 15:27:34.000000000 -0400
 @@ -23,7 +23,8 @@
  
  extern void propeller_output_label (FILE *file, const char * name);
@@ -1530,11 +2047,14 @@ diff -urN a/gcc/config/propeller/propeller-protos.h b/gcc/config/propeller/prope
  extern bool propeller_print_operand_punct_valid_p (unsigned char code);
  extern void propeller_output_seqend (FILE *);
  extern void propeller_weaken_label (FILE *file, const char *name);
-@@ -33,9 +34,12 @@
+@@ -33,9 +34,15 @@
  
  extern bool propeller_cogaddr_p (rtx x);
  extern bool propeller_cogmem_p (rtx op);
 +extern bool propeller_srconly_cogmem_p (rtx);
++extern bool propeller_cond_move_to_minmax (rtx *);
++extern bool propeller_cogvar_rmw_ok (rtx, rtx, rtx, rtx, rtx);
++extern bool propeller_shiftmask_p (rtx);
 +extern void propeller_emit_overflow_branch (rtx);
  extern bool propeller_stack_operand_p (rtx op);
  extern bool propeller_legitimate_constant_p (enum machine_mode mode, rtx x);
@@ -1544,7 +2064,7 @@ diff -urN a/gcc/config/propeller/propeller-protos.h b/gcc/config/propeller/prope
  extern bool propeller_const_ok_for_letter_p (HOST_WIDE_INT value, int c);
  
  extern HOST_WIDE_INT propeller_initial_elimination_offset (int from, int to);
-@@ -70,7 +74,7 @@
+@@ -70,7 +77,7 @@
  extern void propeller_emit_stack_pushm (rtx *operands);
  extern void propeller_emit_stack_popm (rtx *operands, int doretaswell);
  
@@ -1554,7 +2074,7 @@ diff -urN a/gcc/config/propeller/propeller-protos.h b/gcc/config/propeller/prope
  
  /* some variable declarations; we put them here rather than in propeller.h
 diff -urN a/libgcc/config/propeller/crtbegin.S b/libgcc/config/propeller/crtbegin.S
---- a/libgcc/config/propeller/crtbegin.S	2026-09-23 22:40:23.941352584 -0400
+--- a/libgcc/config/propeller/crtbegin.S	2026-09-24 17:06:59.578814052 -0400
 +++ b/libgcc/config/propeller/crtbegin.S	2021-07-09 13:06:19.000000000 -0400
 @@ -150,7 +150,12 @@
          mvi     r2,#__bss_end
@@ -1571,7 +2091,7 @@ diff -urN a/libgcc/config/propeller/crtbegin.S b/libgcc/config/propeller/crtbegi
  #endif
  
 diff -urN a/libgcc/config/propeller/kernel.ext b/libgcc/config/propeller/kernel.ext
---- a/libgcc/config/propeller/kernel.ext	2026-09-23 22:40:23.938123610 -0400
+--- a/libgcc/config/propeller/kernel.ext	2026-09-24 17:06:59.575180051 -0400
 +++ b/libgcc/config/propeller/kernel.ext	2026-09-20 23:41:57.000000000 -0400
 @@ -60,6 +60,7 @@
  
@@ -1582,7 +2102,7 @@ diff -urN a/libgcc/config/propeller/kernel.ext b/libgcc/config/propeller/kernel.
  	rev	r0, #0
  __CTZSI
 diff -urN a/libgcc/config/propeller/lib1funcs.asm b/libgcc/config/propeller/lib1funcs.asm
---- a/libgcc/config/propeller/lib1funcs.asm	2026-09-23 22:40:23.939890348 -0400
+--- a/libgcc/config/propeller/lib1funcs.asm	2026-09-24 17:06:59.577086835 -0400
 +++ b/libgcc/config/propeller/lib1funcs.asm	2026-09-21 01:52:09.000000000 -0400
 @@ -1104,6 +1104,11 @@
  		mov	A, r0
